@@ -448,9 +448,10 @@ function startTimers() {
 const app = express();
 app.get('/health', (req, res) => res.json({
   ok: true, connected: state.connected, hasSession: state.hasSession,
-  lastBackup: state.lastBackup, todos: data.todos.filter((x) => !x.done).length, reminders: data.reminders.length,
+  lastBackup: state.lastBackup, pairingCode: state.pairingCode,
+  todos: data.todos.filter((x) => !x.done).length, reminders: data.reminders.length,
 }));
-app.get('/', (req, res) => res.type('text/plain').send(`wa-agent\nconnected: ${state.connected}\nsession: ${state.hasSession}\nlastBackup: ${state.lastBackup || 'none yet'}\n`));
+app.get('/', (req, res) => res.type('text/plain').send(`wa-agent\nconnected: ${state.connected}\nsession: ${state.hasSession}\npairing: ${state.pairingCode || 'none yet'}\nlastBackup: ${state.lastBackup || 'none yet'}\n`));
 
 /* ---------- main ---------- */
 if (require.main === module) {
