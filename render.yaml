@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: wa-agent
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: WA_PHONE
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_BASE_URL
+        value: https://generativelanguage.googleapis.com/v1beta/openai/
+      - key: MODEL
+        value: gemini-2.0-flash
+      - key: SYSTEM_PROMPT
+        value: You are Ashish's personal WhatsApp assistant. Reply in the same language the user writes in (usually Hindi/Hinglish). Be brief, warm and helpful. When asked to remind, note or plan something, give a direct useful answer.
+      - key: SESSION_BACKUP_TOKEN
+        sync: false
+      - key: SESSION_BACKUP_REPO
+        sync: false
+      - key: SESSION_BACKUP_PASS
+        sync: false
