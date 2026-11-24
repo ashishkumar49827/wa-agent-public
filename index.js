@@ -1,10 +1,11 @@
-/* wa-agent v2: WhatsApp AI assistant (Render-free-tier ready)
+/* wa-agent v3: WhatsApp AI assistant (Perisclaw-style persona)
  * - Connects to YOUR WhatsApp number as a linked device (Baileys / WhatsApp-Web protocol)
  * - Answers in your self-chat ("Message yourself"), and in any chat when you type "/claw <text>"
+ * - Perisclaw-style personality: short Hinglish replies, friend energy, no corporate tone
+ * - Robust text extraction (ephemeral / view-once / captions), read receipt + typing indicator
  * - Todos, reminders, notes, chat labels, search, daily digest (/help)
  * - /health endpoint for UptimeRobot keep-alive pings
- * - WhatsApp session + agent data backed up (encrypted) to a private GitHub repo so
- *   pairing AND your todos/reminders/notes survive Render redeploys (ephemeral disk)
+ * - WhatsApp session + agent data backed up (encrypted) to a private GitHub repo
  */
 const express = require('express');
 const pino = require('pino');
@@ -24,19 +25,31 @@ const DATA_FILE = path.join(SESSION_DIR, 'agent-data.json');
 const WA_PHONE = (process.env.WA_PHONE || '').replace(/[^0-9]/g, '');
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/').replace(/\/?$/, '/');
-const MODEL = process.env.MODEL || 'gemini-2.0-flash';
+const MODEL = process.env.MODEL || 'gemini-2.5-flash';
+const OWNER_NAME = process.env.OWNER_NAME || 'Ashish';
+const BOT_NAME = process.env.BOT_NAME || 'Claw';
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
-  'You are a personal WhatsApp assistant. Reply in the same language the user writes in (usually Hindi/Hinglish). Be brief, warm and helpful.';
+  `Tum ${BOT_NAME} ho, ${OWNER_NAME} ka personal WhatsApp assistant (Perisclaw jaisa).\n` +
+  `Awaaz: dost jaisi. Chhota, seedha, thoda shararti. User jis bhasha me likhe usi me jawab do (Hindi, English ya Hinglish - "haan yaar ho gaya" style Hinglish aam hai).\n` +
+  `Rules:\n` +
+  `- Aam baat me 1-3 line. Lamba jawab sirf tab jab data, list, ya explain karne ko kaha jaye.\n` +
+  `- Kaam ki baat pehle. Corporate ya chatbot tone kabhi nahi ("main aapki kaise madad kar sakta hoon" type kabhi nahi).\n` +
+  `- Faltu disclaimer aur repetition nahi. Ek hi baat do baar na kaho.\n` +
+  `- Emoji 0-2, sirf tab jab sach me baat ke sath baithe.\n` +
+  `- Jhoot mat bolo. Pata na ho to seedha bolo "pata nahi" aur chaho to dekhne ka tarika batao.\n` +
+  `- Tumhare paas ye commands hain: /todo, /remind, /note, /notes, /find, /clear, /stop, /ignore, /restart, /digest, /claw. Jab user ka kaam inse ho sakta hai, ek line me bol do ki wo command likh de (khud command nahi chala sakte).\n` +
+  `- Reminders ka format: /remind 10m chai ya /remind 17:30 call mummy.\n` +
+  `- Kisi ke personal baatein ya private data kisi aur ke naam na karo.`;
 const GH_TOKEN = process.env.SESSION_BACKUP_TOKEN || '';
-const GH_REPO = process.env.SESSION_BACKUP_REPO || ''; // e.g. "youruser/wa-agent-session"
+const GH_REPO = process.env.SESSION_BACKUP_REPO || '';
 const GH_PASS = process.env.SESSION_BACKUP_PASS || '';
 const GH_FILE = process.env.SESSION_BACKUP_FILE || 'session.enc';
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
-const state = { connected: false, hasSession: false, pairingCode: null, lastBackup: null, selfChatJid: null };
-const sentIds = new Set(); // message ids WE sent, to avoid answering ourselves
+const state = { connected: false, hasSession: false, pairingCode: null, lastBackup: null, selfChatJid: null, lastLLMError: null };
+const sentIds = new Set();
 let lastReply = { jid: null, text: '', ts: 0 };
-const abortMap = new Map(); // jid -> AbortController for in-flight LLM calls
+const abortMap = new Map();
 
 /* ---------- agent data (rides the encrypted session backup) ---------- */
 let data = { nextId: 1, todos: [], reminders: [], notes: [], labels: {}, history: {}, lastDigest: null, digestHour: 8, ignoredIds: [] };
@@ -132,22 +145,82 @@ async function doBackup() {
   } catch (e) { log.error({ err: e.message }, 'session backup failed'); }
 }
 
+/* ---------- text extraction (handles ephemeral / view-once / captions) ---------- */
+function unwrapMsg(msg) {
+  let m = msg;
+  let guard = 0;
+  while (m && guard++ < 6) {
+    if (m.ephemeralMessage) m = m.ephemeralMessage.message;
+    else if (m.viewOnceMessage) m = m.viewOnceMessage.message;
+    else if (m.viewOnceMessageV2) m = m.viewOnceMessageV2.message;
+    else if (m.viewOnceMessageV2Extension) m = m.viewOnceMessageV2Extension.message;
+    else if (m.documentWithCaptionMessage) m = m.documentWithCaptionMessage.message;
+    else break;
+  }
+  return m || {};
+}
+function extractText(msg) {
+  const m = unwrapMsg(msg);
+  return (m.conversation ||
+    (m.extendedTextMessage && m.extendedTextMessage.text) ||
+    (m.imageMessage && m.imageMessage.caption) ||
+    (m.videoMessage && m.videoMessage.caption) ||
+    (m.documentMessage && m.documentMessage.caption) ||
+    (m.buttonsResponseMessage && m.buttonsResponseMessage.selectedDisplayText) ||
+    (m.listResponseMessage && m.listResponseMessage.title) || '').trim();
+}
+function quotedText(msg) {
+  const m = unwrapMsg(msg);
+  const ctx = m.extendedTextMessage && m.extendedTextMessage.contextInfo;
+  if (!ctx || !ctx.quotedMessage) return '';
+  return extractText(ctx.quotedMessage);
+}
+
 /* ---------- LLM ---------- */
+function crossChatContext() {
+  const parts = [];
+  for (const [j, msgs] of Object.entries(data.history)) {
+    if (j === state.selfChatJid) continue;
+    const users = msgs.filter((x) => x.role === 'user').slice(-3);
+    for (const u of users) parts.push(u.content.slice(0, 100));
+  }
+  if (!parts.length) return '';
+  return `Baaki chats ke haal ke messages (sirf context ke liye):\n${parts.slice(-8).join('\n')}`;
+}
 async function askLLM(chatJid, userText, signal) {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY not set');
-  const res = await fetch(`${OPENAI_BASE_URL}chat/completions`, {
-    signal,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...getHist(chatJid).slice(-24)],
-      max_tokens: 800,
-    }),
-  });
-  if (!res.ok) throw new Error(`LLM ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const d = await res.json();
-  return (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || '...';
+  const now = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true });
+  const cc = crossChatContext();
+  const sys = `${SYSTEM_PROMPT}\n\nAbhi: ${now} IST.${cc ? `\n\n${cc}` : ''}`;
+  const tryModels = MODEL === 'gemini-2.0-flash' ? ['gemini-2.0-flash'] : [MODEL, 'gemini-2.0-flash'];
+  let lastErr = null;
+  for (const mdl of tryModels) {
+    try {
+      const res = await fetch(`${OPENAI_BASE_URL}chat/completions`, {
+        signal,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` },
+        body: JSON.stringify({
+          model: mdl,
+          messages: [{ role: 'system', content: sys }, ...getHist(chatJid).slice(-24)],
+          max_tokens: 700,
+          temperature: 0.9,
+        }),
+      });
+      if (res.ok) {
+        const d = await res.json();
+        state.lastLLMError = null;
+        return (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || '...';
+      }
+      lastErr = new Error(`LLM ${mdl} ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      if (res.status !== 404 && res.status !== 429) break;
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      lastErr = e;
+      break;
+    }
+  }
+  throw lastErr || new Error('LLM failed');
 }
 
 /* ---------- helpers ---------- */
@@ -209,7 +282,7 @@ async function handleCommand(sock, jid, text, msg) {
     return true;
   }
   if (/^\/ignore\b/i.test(t)) {
-    const ctx = msg && msg.message && msg.message.extendedTextMessage && msg.message.extendedTextMessage.contextInfo;
+    const ctx = msg && msg.message && unwrapMsg(msg.message).extendedTextMessage && unwrapMsg(msg.message).extendedTextMessage.contextInfo;
     const qid = ctx && ctx.stanzaId;
     if (qid) {
       if (!data.ignoredIds.includes(qid)) {
@@ -301,10 +374,17 @@ async function handleCommand(sock, jid, text, msg) {
 
 /* ---------- WhatsApp ---------- */
 async function send(sock, jid, text) {
-  lastReply = { jid, text, ts: Date.now() };
-  const res = await sock.sendMessage(jid, { text });
-  if (res && res.key && res.key.id) sentIds.add(res.key.id);
-  return res;
+  const s = String(text || '').trim();
+  const chunks = [];
+  if (s.length <= 3500) chunks.push(s);
+  else for (let i = 0; i < s.length; i += 3500) chunks.push(s.slice(i, i + 3500));
+  let last = null;
+  for (const c of chunks) {
+    lastReply = { jid, text: c, ts: Date.now() };
+    last = await sock.sendMessage(jid, { text: c });
+    if (last && last.key && last.key.id) sentIds.add(last.key.id);
+  }
+  return last;
 }
 async function startSock() {
   const { state: auth, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -351,7 +431,7 @@ async function startSock() {
         const isGroup = jid.endsWith('@g.us');
         if (data.ignoredIds && data.ignoredIds.includes(m.key.id)) continue;
         const msg = m.message || {};
-        const text = (msg.conversation || (msg.extendedTextMessage && msg.extendedTextMessage.text)) || '';
+        const text = extractText(msg);
         if (!text.trim()) continue;
         if (m.key.id && sentIds.has(m.key.id)) continue;
         if (m.key.fromMe && lastReply.jid === jid && lastReply.text === text && Date.now() - lastReply.ts < 120_000) continue;
@@ -383,29 +463,34 @@ async function startSock() {
         const isCmd = await handleCommand(sock, jid, text);
         if (isCmd) continue;
 
-        // quoted reply gives the AI context
-        let q = text.replace(/^\/claw\s+/i, '');
-        const quoted = msg.extendedTextMessage && msg.extendedTextMessage.contextInfo && msg.extendedTextMessage.contextInfo.quotedMessage;
-        const qText = quoted && (quoted.conversation || (quoted.extendedTextMessage && quoted.extendedTextMessage.text));
-        if (qText && selfChat) q = `Pehle ye message tha:\n"${qText.slice(0, 300)}"\n\nAb ye: ${q}`;
+        // blue tick + typing indicator, phir LLM
+        try { await sock.readMessages([m.key]); } catch (e) {}
+        try { await sock.sendPresenceUpdate('composing', jid); } catch (e) {}
 
-        pushHist(jid, 'user', q);
+        const q = text.replace(/^\/claw\s+/i, '');
+        const qText = quotedText(msg);
+        const userText = qText && selfChat ? `Pehle ye message tha:\n"${qText.slice(0, 300)}"\n\nAb ye: ${q}` : q;
+
+        pushHist(jid, 'user', userText);
         const ctrl = new AbortController();
         abortMap.set(jid, ctrl);
         try {
-          const reply = await askLLM(jid, q, ctrl.signal);
+          const reply = await askLLM(jid, userText, ctrl.signal);
           pushHist(jid, 'assistant', reply);
           saveData();
+          await sock.sendPresenceUpdate('paused', jid).catch(() => {});
           await send(sock, jid, reply);
         } catch (e) {
           if (e && e.name === 'AbortError') {
             log.info({ jid }, 'LLM call stopped by /stop');
           } else {
+            state.lastLLMError = String(e.message || e).slice(0, 140);
             log.error({ err: e.message }, 'LLM failed');
-            await send(sock, jid, 'LLM se baat nahi hui. API key ya model check karo.');
+            await send(sock, jid, 'oops, upar wala server thoda naraz hai. Thodi der baad phir bhejo.');
           }
         } finally {
           abortMap.delete(jid);
+          try { await sock.sendPresenceUpdate('paused', jid); } catch (e) {}
         }
       } catch (e) { log.error({ err: e.message }, 'message handling failed'); }
     }
@@ -449,6 +534,7 @@ const app = express();
 app.get('/health', (req, res) => res.json({
   ok: true, connected: state.connected, hasSession: state.hasSession,
   lastBackup: state.lastBackup, pairingCode: state.pairingCode,
+  model: MODEL, lastLLMError: state.lastLLMError,
   todos: data.todos.filter((x) => !x.done).length, reminders: data.reminders.length,
 }));
 app.get('/', (req, res) => res.type('text/plain').send(`wa-agent\nconnected: ${state.connected}\nsession: ${state.hasSession}\npairing: ${state.pairingCode || 'none yet'}\nlastBackup: ${state.lastBackup || 'none yet'}\n`));
